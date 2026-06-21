@@ -1,39 +1,39 @@
 #!/usr/bin/env python3
 """
-语音情感分类 - CLI客户端
+语音情感分类 - CLI客户端 (WebSocket 流式版)
 
 功能：
-- 使用设备原生采样率录制麦克风音频，自动重采样到16kHz（服务端要求）
-- 每5秒一段，客户端先做VAD静音检测，可跳过静音段
-- 调用服务端 /predict 接口进行情感分类
-- 终端彩色打印情感概率分布（红=愤怒, 绿=开心, 蓝=难过, 灰=中性, 深灰=静音）
+- 使用设备原生采样率录制麦克风音频，自动重采样到16kHz
+- 建立WebSocket长连接，每500ms发送一小段PCM音频流
+- 服务端实时累积5秒滑窗，每500ms推回一次情感推理结果
+- 终端实时显示当前情感概率，以及最近10个窗口的ASCII柱状图历史曲线
 """
 import argparse
-import io
+import asyncio
+import json
+import queue
 import sys
 import threading
 import time
-import wave
+from collections import deque
 from datetime import datetime
 
 import colorama
 import librosa
 import numpy as np
-import requests
 import sounddevice as sd
+import websockets
 
 
 TARGET_SAMPLE_RATE = 16000
 RECORD_SAMPLE_RATES_TO_TRY = [48000, 44100, 32000, 22050, 16000]
 CHANNELS = 1
-SAMPLE_WIDTH = 2
-CHUNK_DURATION = 5.0
+CHUNK_DURATION = 0.5
+HISTORY_WINDOW = 10
 
 VAD_RMS_THRESHOLD = 0.005
 VAD_SPEECH_RATIO_THRESHOLD = 0.10
 HOP_LENGTH = 256
-
-SKIP_SILENT_ON_CLIENT = False
 
 
 EMOTION_COLORS = {
@@ -59,6 +59,68 @@ EMOTION_ZH = {
     "neutral": "中性",
     "silent": "静音",
 }
+
+EMOTION_ORDER = ["happy", "sad", "angry", "neutral", "silent"]
+
+
+def make_bar(pct: float, width: int = 20) -> str:
+    filled = int(round(width * pct))
+    filled = max(0, min(width, filled))
+    bar = "█" * filled + "░" * (width - filled)
+    return bar
+
+
+def make_histogram(history: deque[dict], height: int = 8) -> str:
+    if len(history) == 0:
+        return "  (等待数据...)\n"
+
+    n = len(history)
+    lines = []
+
+    for emo in EMOTION_ORDER:
+        probs = [frame["emotions"].get(emo, 0.0) for frame in history]
+        max_p = max(max(probs), 0.01)
+
+        row_chars = [" " * height for _ in range(height)]
+
+        for t_idx, p in enumerate(probs):
+            bar_h = int(round(height * p / max_p)) if max_p > 0 else 0
+            bar_h = max(0, min(height, bar_h))
+            for h in range(height):
+                row_idx = height - 1 - h
+                pos = t_idx * 2
+                if h < bar_h:
+                    s = row_chars[row_idx]
+                    c = "█"
+                    row_chars[row_idx] = s[:pos] + c + s[pos + 1 :]
+
+        c = EMOTION_COLORS.get(emo, "")
+        icon = EMOTION_ICONS.get(emo, "?")
+        zh = EMOTION_ZH.get(emo, emo)
+        reset = colorama.Style.RESET_ALL
+
+        if max_p < 0.01:
+            lines.append(f"  {c}{icon} {zh:<4}{reset}   (无数据)")
+            continue
+
+        lines.append(f"  {c}{icon} {zh:<4}{reset}  {c}{row_chars[0]}{reset}")
+        for r in row_chars[1:]:
+            lines.append(f"         {c}{r}{reset}")
+        lines.append(f"         {c}{'─' * (n * 2 - 1)}{reset}  max={max_p:.0%}")
+        lines.append("")
+
+    x_labels = "  "
+    for i in range(n):
+        if i % 2 == 0:
+            idx = len(history) - n + i
+            seq = history[idx].get("seq", idx + 1)
+            label = f"#{seq:<3}"
+        else:
+            label = "   "
+        x_labels += label[:2]
+    lines.append(x_labels)
+    lines.append(f"  最近{n}个推理窗口 (每500ms一个)")
+    return "\n".join(lines) + "\n"
 
 
 def _detect_silence_local(audio: np.ndarray, sr: int) -> tuple[bool, float, float]:
@@ -91,7 +153,7 @@ def _detect_silence_local(audio: np.ndarray, sr: int) -> tuple[bool, float, floa
     return is_silent, speech_ratio, avg_rms
 
 
-def encode_wav(audio_float32: np.ndarray, orig_sr: int) -> bytes:
+def encode_pcm(audio_float32: np.ndarray, orig_sr: int) -> bytes:
     if orig_sr != TARGET_SAMPLE_RATE:
         audio_resampled = librosa.resample(
             audio_float32, orig_sr=orig_sr, target_sr=TARGET_SAMPLE_RATE
@@ -99,71 +161,9 @@ def encode_wav(audio_float32: np.ndarray, orig_sr: int) -> bytes:
     else:
         audio_resampled = audio_float32
 
-    max_samples = int(CHUNK_DURATION * TARGET_SAMPLE_RATE)
-    if len(audio_resampled) > max_samples:
-        audio_resampled = audio_resampled[:max_samples]
-    elif len(audio_resampled) < max_samples:
-        audio_resampled = np.pad(
-            audio_resampled,
-            (0, max_samples - len(audio_resampled)),
-            mode="constant",
-        )
-
     audio_int16 = np.clip(audio_resampled, -1.0, 1.0)
     audio_int16 = (audio_int16 * 32767.0).astype(np.int16)
-
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(CHANNELS)
-        wf.setsampwidth(SAMPLE_WIDTH)
-        wf.setframerate(TARGET_SAMPLE_RATE)
-        wf.writeframes(audio_int16.tobytes())
-    return buf.getvalue()
-
-
-def make_bar(pct: float, width: int = 25) -> str:
-    filled = int(round(width * pct))
-    filled = max(0, min(width, filled))
-    bar = "█" * filled + "░" * (width - filled)
-    return bar
-
-
-def print_result(result: dict, index: int, latency_ms: float, skipped: bool = False):
-    emotions = result.get("emotions", {})
-    dominant = result.get("dominant", "neutral")
-    confidence = result.get("confidence", 0.0)
-    speech_ratio = result.get("vad_speech_ratio", 0.0)
-    avg_rms = result.get("vad_avg_rms", 0.0)
-
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    dom_color = EMOTION_COLORS.get(dominant, "")
-    dom_icon = EMOTION_ICONS.get(dominant, "?")
-    dom_zh = EMOTION_ZH.get(dominant, dominant)
-    reset = colorama.Style.RESET_ALL
-
-    skip_tag = ""
-    if skipped:
-        skip_tag = f"{colorama.Fore.LIGHTBLACK_EX} [本地跳过]{reset}"
-
-    header = (
-        f"{colorama.Fore.CYAN}[{timestamp}]{reset} "
-        f"第{colorama.Fore.YELLOW}{index}{reset}段 "
-        f"({latency_ms:.0f}ms) "
-        f"语音占比:{speech_ratio:.0%} RMS:{avg_rms:.4f}{skip_tag}"
-        f"\n  主导情绪: {dom_color}{dom_icon} {dom_zh} ({confidence:.1%}){reset}"
-    )
-    print(header)
-
-    order = ["happy", "sad", "angry", "neutral", "silent"]
-    for emo in order:
-        prob = emotions.get(emo, 0.0)
-        c = EMOTION_COLORS.get(emo, "")
-        icon = EMOTION_ICONS.get(emo, "?")
-        zh = EMOTION_ZH.get(emo, emo)
-        bar = make_bar(prob)
-        line = f"  {c}{icon} {zh:<4}{reset} {c}{bar}{reset} {prob:6.1%}"
-        print(line)
-    print()
+    return audio_int16.tobytes()
 
 
 def _probe_record_sample_rate(device_id: int | None) -> int:
@@ -184,7 +184,9 @@ def _probe_record_sample_rate(device_id: int | None) -> int:
             continue
         seen.add(sr)
         try:
-            sd.check_input_settings(samplerate=sr, channels=CHANNELS, dtype="float32", device=device_id)
+            sd.check_input_settings(
+                samplerate=sr, channels=CHANNELS, dtype="float32", device=device_id
+            )
             return sr
         except Exception:
             continue
@@ -194,14 +196,15 @@ def _probe_record_sample_rate(device_id: int | None) -> int:
 
 
 class Recorder:
-    def __init__(self, device_id: int | None, channels: int = CHANNELS):
-        self.channels = channels
+    def __init__(self, device_id: int | None, chunk_duration: float = CHUNK_DURATION):
+        self.chunk_duration = chunk_duration
         self.device_id = device_id
         self.sr = _probe_record_sample_rate(device_id)
 
         self._stream: sd.InputStream | None = None
         self._buffer = np.array([], dtype=np.float32)
         self._lock = threading.Lock()
+        self._chunk_samples = int(self.sr * self.chunk_duration)
 
     def _callback(self, indata, frames, time_info, status):
         if status:
@@ -216,7 +219,7 @@ class Recorder:
         blocksize = max(128, int(self.sr * 0.05))
         self._stream = sd.InputStream(
             samplerate=self.sr,
-            channels=self.channels,
+            channels=CHANNELS,
             dtype="float32",
             blocksize=blocksize,
             callback=self._callback,
@@ -230,167 +233,13 @@ class Recorder:
             self._stream.close()
             self._stream = None
 
-    def get_chunk(self, duration_sec: float) -> tuple[np.ndarray, int] | None:
-        n_samples = int(self.sr * duration_sec)
+    def get_chunk(self) -> tuple[np.ndarray, int] | None:
         with self._lock:
-            if len(self._buffer) < n_samples:
+            if len(self._buffer) < self._chunk_samples:
                 return None
-            chunk = self._buffer[:n_samples].copy()
-            self._buffer = self._buffer[n_samples:]
+            chunk = self._buffer[: self._chunk_samples].copy()
+            self._buffer = self._buffer[self._chunk_samples :]
         return chunk, self.sr
-
-
-def send_wav(server_url: str, wav_bytes: bytes, timeout: float = 30.0) -> dict | None:
-    endpoint = server_url.rstrip("/") + "/predict"
-    try:
-        files = {"file": ("chunk.wav", wav_bytes, "audio/wav")}
-        resp = requests.post(endpoint, files=files, timeout=timeout)
-        if resp.status_code != 200:
-            try:
-                detail = resp.json().get("detail", resp.text)
-            except Exception:
-                detail = resp.text
-            print(
-                f"{colorama.Fore.RED}[请求失败] HTTP {resp.status_code}: "
-                f"{detail}{colorama.Style.RESET_ALL}",
-                file=sys.stderr,
-            )
-            return None
-        return resp.json()
-    except requests.ConnectionError:
-        print(
-            f"{colorama.Fore.RED}[连接错误] 无法连接到服务端 {server_url}{colorama.Style.RESET_ALL}",
-            file=sys.stderr,
-        )
-        return None
-    except requests.Timeout:
-        print(
-            f"{colorama.Fore.YELLOW}[超时] 服务端响应超时{colorama.Style.RESET_ALL}",
-            file=sys.stderr,
-        )
-        return None
-    except Exception as e:
-        print(
-            f"{colorama.Fore.RED}[错误] {e}{colorama.Style.RESET_ALL}",
-            file=sys.stderr,
-        )
-        return None
-
-
-def check_server(server_url: str) -> bool:
-    try:
-        resp = requests.get(server_url.rstrip("/") + "/health", timeout=5.0)
-        return resp.status_code == 200
-    except Exception:
-        return False
-
-
-def run_single_file(server_url: str, wav_path: str) -> int:
-    print(f"{colorama.Fore.CYAN}分析文件: {wav_path}{colorama.Style.RESET_ALL}")
-    try:
-        with open(wav_path, "rb") as f:
-            data = f.read()
-    except FileNotFoundError:
-        print(f"{colorama.Fore.RED}文件不存在: {wav_path}{colorama.Style.RESET_ALL}")
-        return 1
-
-    t0 = time.time()
-    result = send_wav(server_url, data)
-    latency = (time.time() - t0) * 1000
-    if result is None:
-        return 1
-    print_result(result, 1, latency)
-    return 0
-
-
-def _build_local_silent_result(speech_ratio: float, avg_rms: float) -> dict:
-    return {
-        "emotions": {
-            "happy": 0.0,
-            "sad": 0.0,
-            "angry": 0.0,
-            "neutral": 0.0,
-            "silent": 1.0,
-        },
-        "dominant": "silent",
-        "confidence": 1.0,
-        "is_silent": True,
-        "vad_speech_ratio": speech_ratio,
-        "vad_avg_rms": avg_rms,
-    }
-
-
-def run_realtime(server_url: str, device_id: int | None, skip_silent: bool):
-    colorama.init()
-
-    try:
-        recorder = Recorder(device_id=device_id)
-    except RuntimeError as e:
-        print(f"{colorama.Fore.RED}{e}{colorama.Style.RESET_ALL}")
-        return
-
-    actual_sr = recorder.sr
-    recorder.start()
-
-    server_ok = check_server(server_url)
-    if not server_ok:
-        print(
-            f"{colorama.Fore.YELLOW}[警告] 无法连接到服务端 {server_url}\n"
-            f"请先启动服务端: python -m uvicorn main:app --reload --port 8000"
-            f"{colorama.Style.RESET_ALL}\n"
-        )
-
-    print(
-        f"{colorama.Fore.MAGENTA}{colorama.Style.BRIGHT}"
-        "====== 语音情感识别 (实时模式) ======\n"
-        f"{colorama.Style.RESET_ALL}"
-        f"{colorama.Fore.CYAN}"
-        f"录音设备采样率: {actual_sr}Hz (自动重采样到 {TARGET_SAMPLE_RATE}Hz)\n"
-        f"段长: {CHUNK_DURATION}秒 | 服务端: {server_url}\n"
-        f"VAD阈值: RMS>={VAD_RMS_THRESHOLD}, 语音占比>={VAD_SPEECH_RATIO_THRESHOLD:.0%}\n"
-        f"客户端跳过静音: {'是' if skip_silent else '否'} | 按 Ctrl+C 退出"
-        f"{colorama.Style.RESET_ALL}\n"
-    )
-
-    chunk_idx = 0
-    try:
-        while True:
-            got = recorder.get_chunk(CHUNK_DURATION)
-            if got is None:
-                time.sleep(0.02)
-                continue
-
-            chunk_idx += 1
-            audio_chunk, chunk_sr = got
-
-            is_silent, speech_ratio, avg_rms = _detect_silence_local(audio_chunk, chunk_sr)
-
-            if skip_silent and is_silent:
-                fake_result = _build_local_silent_result(speech_ratio, avg_rms)
-                print_result(fake_result, chunk_idx, 0.0, skipped=True)
-                continue
-
-            try:
-                wav_bytes = encode_wav(audio_chunk, chunk_sr)
-            except Exception as e:
-                print(
-                    f"{colorama.Fore.RED}[编码错误] {e}{colorama.Style.RESET_ALL}",
-                    file=sys.stderr,
-                )
-                continue
-
-            t0 = time.time()
-            result = send_wav(server_url, wav_bytes)
-            latency = (time.time() - t0) * 1000
-
-            if result is not None:
-                print_result(result, chunk_idx, latency)
-
-    except KeyboardInterrupt:
-        print(f"\n{colorama.Fore.YELLOW}用户中断，正在退出...{colorama.Style.RESET_ALL}")
-    finally:
-        recorder.stop()
-        print(f"{colorama.Fore.GREEN}已停止录音{colorama.Style.RESET_ALL}")
 
 
 def list_devices():
@@ -403,19 +252,303 @@ def list_devices():
             print(f"  [{i}] {dev['name']} (默认采样率:{sr}Hz){marker}")
 
 
+def print_header(record_sr: int, ws_url: str, mode: str):
+    print(
+        f"{colorama.Fore.MAGENTA}{colorama.Style.BRIGHT}"
+        "====== 语音情感识别 (实时流模式) ======\n"
+        f"{colorama.Style.RESET_ALL}"
+        f"{colorama.Fore.CYAN}"
+        f"模式: {mode}\n"
+        f"录音设备采样率: {record_sr}Hz (自动重采样到 {TARGET_SAMPLE_RATE}Hz)\n"
+        f"帧长: {CHUNK_DURATION * 1000:.0f}ms | 滑窗: 5s | 推理频率: 2Hz\n"
+        f"服务端: {ws_url}\n"
+        f"VAD阈值: RMS>={VAD_RMS_THRESHOLD}, 语音占比>={VAD_SPEECH_RATIO_THRESHOLD:.0%}\n"
+        f"按 Ctrl+C 退出"
+        f"{colorama.Style.RESET_ALL}\n"
+    )
+
+
+def render_display(
+    result: dict,
+    history: deque[dict],
+    chunks_sent: int,
+    results_received: int,
+    local_vad_silent: bool,
+    local_vad_ratio: float,
+    local_vad_rms: float,
+):
+    seq = result.get("seq", 0)
+    emotions = result.get("emotions", {})
+    dominant = result.get("dominant", "neutral")
+    confidence = result.get("confidence", 0.0)
+    is_silent = result.get("is_silent", False)
+    speech_ratio = result.get("vad_speech_ratio", 0.0)
+    avg_rms = result.get("vad_avg_rms", 0.0)
+    inference_ms = result.get("inference_ms", 0.0)
+
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    dom_color = EMOTION_COLORS.get(dominant, "")
+    dom_icon = EMOTION_ICONS.get(dominant, "?")
+    dom_zh = EMOTION_ZH.get(dominant, dominant)
+    reset = colorama.Style.RESET_ALL
+
+    header = (
+        f"{colorama.Fore.CYAN}[{timestamp}]{reset} "
+        f"帧:{colorama.Fore.YELLOW}#{seq}{reset} "
+        f"发送:{chunks_sent} 接收:{results_received} | "
+        f"推理耗时:{inference_ms:.0f}ms\n"
+        f"  本地VAD: {'静音' if local_vad_silent else '有语音'} "
+        f"语音占比:{local_vad_ratio:.0%} RMS:{local_vad_rms:.4f}\n"
+        f"  服务端VAD: {'静音' if is_silent else '有语音'} "
+        f"语音占比:{speech_ratio:.0%} RMS:{avg_rms:.4f}\n"
+        f"  主导情绪: {dom_color}{dom_icon} {dom_zh} ({confidence:.1%}){reset}"
+    )
+    print(header)
+
+    for emo in EMOTION_ORDER:
+        prob = emotions.get(emo, 0.0)
+        c = EMOTION_COLORS.get(emo, "")
+        icon = EMOTION_ICONS.get(emo, "?")
+        zh = EMOTION_ZH.get(emo, emo)
+        bar = make_bar(prob, width=25)
+        line = f"  {c}{icon} {zh:<4}{reset} {c}{bar}{reset} {prob:6.1%}"
+        print(line)
+
+    print()
+    print(f"{colorama.Fore.MAGENTA}====== 最近{HISTORY_WINDOW}个窗口历史曲线 ======{reset}")
+    print(make_histogram(history))
+    print("\033[F" * 0, end="")
+
+
+async def _ws_receiver(ws, result_queue: asyncio.Queue, stop_event: asyncio.Event):
+    try:
+        async for msg in ws:
+            if stop_event.is_set():
+                break
+            if isinstance(msg, str):
+                try:
+                    data = json.loads(msg)
+                except json.JSONDecodeError:
+                    continue
+                await result_queue.put(data)
+    except websockets.exceptions.ConnectionClosed:
+        pass
+    except Exception as e:
+        print(
+            f"\n{colorama.Fore.RED}[WebSocket错误] {e}{colorama.Style.RESET_ALL}",
+            file=sys.stderr,
+        )
+    finally:
+        stop_event.set()
+
+
+async def run_stream_client(
+    server_url: str,
+    device_id: int | None,
+    use_http: bool = False,
+    history_size: int = HISTORY_WINDOW,
+):
+    colorama.init()
+
+    try:
+        recorder = Recorder(device_id=device_id)
+    except RuntimeError as e:
+        print(f"{colorama.Fore.RED}{e}{colorama.Style.RESET_ALL}")
+        return
+
+    actual_sr = recorder.sr
+    recorder.start()
+
+    mode = "HTTP 轮询" if use_http else "WebSocket 流式"
+    ws_url = server_url.replace("http://", "ws://").replace("https://", "wss://") + "/ws/stream"
+    print_header(actual_sr, ws_url, mode)
+
+    result_queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=20)
+    stop_event = asyncio.Event()
+
+    history: deque[dict] = deque(maxlen=history_size)
+
+    ws = None
+    receiver_task = None
+
+    if not use_http:
+        try:
+            ws = await websockets.connect(ws_url, ping_interval=30, ping_timeout=10)
+            hello = await asyncio.wait_for(ws.recv(), timeout=5.0)
+            if isinstance(hello, str):
+                hello_data = json.loads(hello)
+                if hello_data.get("type") == "hello":
+                    print(
+                        f"{colorama.Fore.GREEN}[WebSocket] 已连接 | "
+                        f"模型已加载: {hello_data.get('model_loaded', False)} | "
+                        f"服务端窗口: {hello_data.get('window_duration', 5)}s | "
+                        f"推理频率: {1.0 / hello_data.get('inference_interval', 0.5):.0f}Hz"
+                        f"{colorama.Style.RESET_ALL}\n"
+                    )
+        except asyncio.TimeoutError:
+            print(
+                f"{colorama.Fore.RED}[WebSocket] 服务端响应超时{colorama.Style.RESET_ALL}"
+            )
+            recorder.stop()
+            return
+        except Exception as e:
+            print(
+                f"{colorama.Fore.RED}[WebSocket] 连接失败: {e}\n"
+                f"请确认服务端已启动: python -m uvicorn main:app --port 8000"
+                f"{colorama.Style.RESET_ALL}"
+            )
+            recorder.stop()
+            return
+
+        receiver_task = asyncio.create_task(
+            _ws_receiver(ws, result_queue, stop_event)
+        )
+
+    chunks_sent = 0
+    results_received = 0
+    seq_counter = 0
+    local_vad_silent = False
+    local_vad_ratio = 0.0
+    local_vad_rms = 0.0
+
+    try:
+        while not stop_event.is_set():
+            chunk = recorder.get_chunk()
+
+            if chunk is None:
+                await asyncio.sleep(0.02)
+                continue
+
+            chunks_sent += 1
+            audio_chunk, chunk_sr = chunk
+
+            is_silent, speech_ratio, avg_rms = _detect_silence_local(audio_chunk, chunk_sr)
+            local_vad_silent = is_silent
+            local_vad_ratio = speech_ratio
+            local_vad_rms = avg_rms
+
+            try:
+                pcm_bytes = encode_pcm(audio_chunk, chunk_sr)
+            except Exception as e:
+                print(
+                    f"\n{colorama.Fore.RED}[编码错误] {e}{colorama.Style.RESET_ALL}",
+                    file=sys.stderr,
+                )
+                await asyncio.sleep(0.01)
+                continue
+
+            if not use_http and ws is not None:
+                try:
+                    await ws.send(pcm_bytes)
+                except Exception:
+                    print(
+                        f"\n{colorama.Fore.RED}[WebSocket] 连接断开{colorama.Style.RESET_ALL}",
+                        file=sys.stderr,
+                    )
+                    break
+
+            while not result_queue.empty():
+                try:
+                    result = result_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+                if result.get("type") == "result":
+                    results_received += 1
+                    seq_counter += 1
+                    result["seq"] = result.get("seq", seq_counter)
+                    history.append(result)
+
+                    print("\033c", end="")
+                    print_header(actual_sr, ws_url, mode)
+                    render_display(
+                        result,
+                        history,
+                        chunks_sent,
+                        results_received,
+                        local_vad_silent,
+                        local_vad_ratio,
+                        local_vad_rms,
+                    )
+
+            if use_http:
+                pass
+
+            await asyncio.sleep(0.01)
+
+    except KeyboardInterrupt:
+        print(f"\n{colorama.Fore.YELLOW}用户中断，正在退出...{colorama.Style.RESET_ALL}")
+        stop_event.set()
+    finally:
+        recorder.stop()
+        if receiver_task is not None and not receiver_task.done():
+            receiver_task.cancel()
+            try:
+                await receiver_task
+            except Exception:
+                pass
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+        print(f"{colorama.Fore.GREEN}已停止录音{colorama.Style.RESET_ALL}")
+
+
+def run_http_client(server_url: str, wav_path: str) -> int:
+    import requests
+
+    print(f"{colorama.Fore.CYAN}分析文件: {wav_path}{colorama.Style.RESET_ALL}")
+    try:
+        with open(wav_path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        print(f"{colorama.Fore.RED}文件不存在: {wav_path}{colorama.Style.RESET_ALL}")
+        return 1
+
+    t0 = time.time()
+    endpoint = server_url.rstrip("/") + "/predict"
+    try:
+        files = {"file": ("chunk.wav", data, "audio/wav")}
+        resp = requests.post(endpoint, files=files, timeout=30)
+        latency = (time.time() - t0) * 1000
+        if resp.status_code != 200:
+            print(
+                f"{colorama.Fore.RED}[请求失败] HTTP {resp.status_code}: "
+                f"{resp.json().get('detail', resp.text)}{colorama.Style.RESET_ALL}",
+                file=sys.stderr,
+            )
+            return 1
+
+        result = resp.json()
+        result["seq"] = 1
+        result["inference_ms"] = latency
+
+        history: deque[dict] = deque(maxlen=HISTORY_WINDOW)
+        history.append(result)
+
+        print("\033c", end="")
+        print_header(0, server_url, "HTTP 文件分析")
+        render_display(result, history, 1, 1, False, 0.0, 0.0)
+        return 0
+    except Exception as e:
+        print(
+            f"{colorama.Fore.RED}[错误] {e}{colorama.Style.RESET_ALL}",
+            file=sys.stderr,
+        )
+        return 1
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="语音情感分类 - CLI客户端",
+        description="语音情感分类 - CLI客户端 (WebSocket 流式版)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  # 实时录音识别（每5秒一段，默认不跳过静音）
+  # WebSocket实时流式识别（每500ms发一帧，服务端滑窗5秒推理）
   python client.py --server http://localhost:8000
 
-  # 实时录音并在客户端跳过静音段（不发送请求）
-  python client.py --server http://localhost:8000 --skip-silent
-
-  # 识别单个WAV文件
+  # 识别单个WAV文件（传统HTTP模式）
   python client.py --server http://localhost:8000 --file test.wav
 
   # 列出可用麦克风
@@ -431,9 +564,10 @@ def main():
     parser.add_argument("--list-devices", action="store_true", help="列出可用音频输入设备")
     parser.add_argument("--device", type=int, help="指定输入设备ID（使用--list-devices查看）")
     parser.add_argument(
-        "--skip-silent",
-        action="store_true",
-        help="客户端检测到静音时跳过发送请求（仅本地打印静音结果）",
+        "--history",
+        type=int,
+        default=HISTORY_WINDOW,
+        help=f"历史曲线显示的窗口数 (默认: {HISTORY_WINDOW})",
     )
 
     args = parser.parse_args()
@@ -444,10 +578,19 @@ def main():
         return
 
     if args.file:
-        code = run_single_file(args.server, args.file)
+        code = run_http_client(args.server, args.file)
         sys.exit(code)
     else:
-        run_realtime(args.server, args.device, args.skip_silent)
+        try:
+            asyncio.run(
+                run_stream_client(
+                    args.server,
+                    args.device,
+                    history_size=args.history,
+                )
+            )
+        except KeyboardInterrupt:
+            pass
 
 
 if __name__ == "__main__":

@@ -1,18 +1,21 @@
 import io
+import json
 import wave
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from server import (
     ALL_EMOTION_LABELS,
     AudioConfig,
+    EmotionFrame,
     EmotionModel,
     EMOTION_LABELS,
     SILENT_LABEL,
+    SlidingWindowSession,
     detect_silence_from_wav_bytes,
     preprocess_audio,
 )
@@ -65,10 +68,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Speech Emotion Classification API",
     description="AI service for speech emotion classification using ONNX model. "
-    "Input: WAV audio (up to 5s). Output: probability distribution over "
+    "Input: WAV audio (up to 5s) or PCM stream via WebSocket. Output: probability distribution over "
     "5 emotion classes (happy, sad, angry, neutral, silent). "
-    "Built-in VAD to detect silence segments.",
-    version="1.1.0",
+    "Built-in VAD to detect silence segments. Supports both REST and WebSocket streaming.",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -116,7 +119,7 @@ def _build_silent_response(speech_ratio: float, avg_rms: float) -> EmotionRespon
 async def root():
     return {
         "service": "Speech Emotion Classification API",
-        "version": "1.1.0",
+        "version": "2.0.0",
         "emotions": ALL_EMOTION_LABELS,
         "vad_thresholds": {
             "rms": AudioConfig.VAD_RMS_THRESHOLD,
@@ -125,6 +128,7 @@ async def root():
         "endpoints": {
             "health": "/health",
             "predict": "/predict (POST, multipart/form-data, field: 'file')",
+            "stream": "/ws/stream (WebSocket, binary PCM frames + JSON metadata)",
         },
     }
 
@@ -205,3 +209,101 @@ async def predict(file: UploadFile = File(...)):
             vad_avg_rms=avg_rms,
         ).model_dump()
     )
+
+
+def _frame_to_dict(frame: EmotionFrame, seq: int) -> dict:
+    return {
+        "seq": seq,
+        "timestamp": frame.timestamp,
+        "emotions": frame.emotions,
+        "dominant": frame.dominant,
+        "confidence": frame.confidence,
+        "is_silent": frame.is_silent,
+        "vad_speech_ratio": frame.vad_speech_ratio,
+        "vad_avg_rms": frame.vad_avg_rms,
+        "inference_ms": frame.inference_ms,
+    }
+
+
+@app.websocket("/ws/stream")
+async def ws_stream(websocket: WebSocket):
+    await websocket.accept()
+
+    session = SlidingWindowSession(
+        model=_model,
+        config=AudioConfig(),
+        window_duration=5.0,
+        inference_interval=0.5,
+    )
+
+    sample_rate = 16000
+    seq = 0
+
+    try:
+        hello = {
+            "type": "hello",
+            "status": "ready",
+            "model_loaded": _model is not None,
+            "emotions": ALL_EMOTION_LABELS,
+            "target_sample_rate": AudioConfig.SAMPLE_RATE,
+            "window_duration": 5.0,
+            "inference_interval": 0.5,
+            "vad_thresholds": {
+                "rms": AudioConfig.VAD_RMS_THRESHOLD,
+                "speech_ratio": AudioConfig.VAD_SPEECH_RATIO_THRESHOLD,
+            },
+        }
+        await websocket.send_text(json.dumps(hello))
+
+        await session.start()
+
+        async def _sender_loop():
+            nonlocal seq
+            while session.is_running():
+                frame = await session.get_next_result(timeout=1.0)
+                if frame is None:
+                    continue
+                seq += 1
+                msg = {"type": "result", **_frame_to_dict(frame, seq)}
+                try:
+                    await websocket.send_text(json.dumps(msg))
+                except Exception:
+                    break
+
+        sender_task = asyncio.create_task(_sender_loop())
+
+        while True:
+            try:
+                data = await websocket.receive()
+            except WebSocketDisconnect:
+                break
+
+            if "bytes" in data:
+                pcm_bytes = data["bytes"]
+                session.feed_audio(pcm_bytes, sample_rate)
+
+            elif "text" in data:
+                try:
+                    msg = json.loads(data["text"])
+                except json.JSONDecodeError:
+                    continue
+
+                msg_type = msg.get("type", "")
+                if msg_type == "config":
+                    sample_rate = int(msg.get("sample_rate", sample_rate))
+                elif msg_type == "ping":
+                    pong = {
+                        "type": "pong",
+                        "timestamp": __import__("time").time(),
+                        "stats": session.get_stats(),
+                    }
+                    await websocket.send_text(json.dumps(pong))
+
+    except Exception:
+        pass
+    finally:
+        await session.stop()
+        try:
+            await websocket.close()
+        except Exception:
+            pass
