@@ -1,4 +1,5 @@
 import os
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -8,6 +9,8 @@ from .audio_preprocessor import AudioConfig, get_mel_spec_shape
 
 
 EMOTION_LABELS = ["happy", "sad", "angry", "neutral"]
+ALL_EMOTION_LABELS = EMOTION_LABELS + ["silent"]
+SILENT_LABEL = "silent"
 
 
 class EmotionModel:
@@ -21,10 +24,27 @@ class EmotionModel:
             raise FileNotFoundError(f"ONNX model not found: {model_path}")
 
         providers = ["CPUExecutionProvider"]
-        if ort.get_device() == "GPU":
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        try:
+            available = ort.get_available_providers()
+            if "CUDAExecutionProvider" in available:
+                providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            elif "DmlExecutionProvider" in available:
+                providers = ["DmlExecutionProvider", "CPUExecutionProvider"]
+        except Exception:
+            pass
 
-        self.session = ort.InferenceSession(str(model_path), providers=providers)
+        sess_options = ort.SessionOptions()
+        sess_options.intra_op_num_threads = 0
+        sess_options.inter_op_num_threads = 0
+        sess_options.log_severity_level = 3
+
+        self.session = ort.InferenceSession(
+            str(model_path),
+            sess_options=sess_options,
+            providers=providers,
+        )
+
+        self._lock = threading.Lock()
 
         self.input_name = self.session.get_inputs()[0].name
         self.input_shape = self.session.get_inputs()[0].shape
@@ -42,7 +62,8 @@ class EmotionModel:
 
         mel_spec = mel_spec.astype(np.float32)
 
-        outputs = self.session.run([self.output_name], {self.input_name: mel_spec})
+        with self._lock:
+            outputs = self.session.run([self.output_name], {self.input_name: mel_spec})
         logits = outputs[0]
 
         if logits.shape[-1] != len(EMOTION_LABELS):
